@@ -7,6 +7,7 @@ from subprocess import call, PIPE, Popen, CalledProcessError, run
 from urllib.parse import urlparse
 from quark.utils import cmake_escape
 import shutil
+import threading
 
 import xml.etree.ElementTree as ElementTree
 
@@ -173,6 +174,7 @@ main project abspath: %s""" % (name, uri, source_dir, target_dir_rp, source_dir_
             freeze_dict = {}
         if update:
             mkdir(subproject_dir)
+        threads = []
         while len(stack):
             current_module = stack.pop()
             if current_module.external_project:
@@ -187,13 +189,17 @@ main project abspath: %s""" % (name, uri, source_dir, target_dir_rp, source_dir_
 
                 def do_add_module(name, depobject):
                     external_project = depobject.get('external_project', False)
-                    add_module(current_module, name,
+                    thread = threading.Thread(target = lambda: 
+                       add_module(current_module, name,
                                freeze_dict.get(name, depobject.get('url', None)),
                                depobject.get('options', {}),
                                depobject,
                                exclude_from_cmake=depobject.get('exclude_from_cmake', external_project),
                                external_project=external_project
                                )
+                    )
+                    threads.append(thread)
+                    thread.start()
 
                 for name, depobject in conf.get('depends', {}).items():
                     do_add_module(name, depobject)
@@ -207,7 +213,11 @@ main project abspath: %s""" % (name, uri, source_dir, target_dir_rp, source_dir_
                             continue
                         if value == optobject['value']:
                             for name, depobject in optobject['depends'].items():
-                                do_add_module(name, depobject)
+                                thread = threading.Thread(target = lambda: do_add_module(name, depobject))
+                                threads.append(thread)
+                                thread.start()
+        for t in threads: t.join()
+
         root.set_local_ignores(subprojects_dir, modules.values())
         return root, modules
 
@@ -302,11 +312,10 @@ class GitSubproject(Subproject):
             # We cannot straight clone a shallow repo using a commit hash (-b doesn't support it)
             # do the dance described at https://stackoverflow.com/a/43136160/214671
             os.mkdir(self.directory)
-            with cd(self.directory):
-                fork(['git', 'init'])
-                fork(['git', 'remote', 'add', 'origin', self.url.geturl()])
-                fork(['git', 'fetch', '--depth', '1', 'origin', self.noremote_ref()])
-                fork(['git', 'checkout', self.ref, '--'])
+            self.git('init')
+            self.git('remote', 'add', 'origin', self.url.geturl())
+            self.git('fetch', '--depth', '1', 'origin', self.noremote_ref())
+            self.git('checkout', self.ref, '--')
         else:
             # Regular case
             extra_opts = []
@@ -317,71 +326,69 @@ class GitSubproject(Subproject):
             if shallow and self.ref_type != 'commit' and self.ref != 'origin/HEAD':
                 extra_opts += ['-b', self.noremote_ref()]
             fork(['git', 'clone', '-n'] + extra_opts + ['--', self.url.geturl(), self.directory])
-            with cd(self.directory):
-                opts = [self.ref]
-                # If it's a branch, create a remote-tracking one
-                if self.ref_type == 'branch' and not shallow:
-                    # Find out a sensible local branch name (needed for origin/HEAD)
-                    local_branch = self.symbolic_full_name(self.ref).split('/origin/', 1)[1]
-                    opts = [ local_branch ]
-                fork(['git', 'checkout'] + opts + ['--'])
+            opts = [self.ref]
+            # If it's a branch, create a remote-tracking one
+            if self.ref_type == 'branch' and not shallow:
+                # Find out a sensible local branch name (needed for origin/HEAD)
+                local_branch = self.symbolic_full_name(self.ref).split('/origin/', 1)[1]
+                opts = [ local_branch ]
+            self.git(*(['checkout'] + opts + ['--']))
 
     def update(self, clean=False):
         def actualUpdate():
-            with cd(self.directory):
-                try:
-                    current_origin = log_check_output(['git', 'config', '--get', 'remote.origin.url']).strip().decode('utf-8')
-                except CalledProcessError:
-                    current_origin = None
-                if current_origin != self.url.geturl():
-                    # For now we just throw a fit; it shouldn't happen often,
-                    # and in this case there's no "right" answer - the repo may
-                    # have just moved, or we may be dealing with a completely
-                    # unrelated repo.
-                    # In future, it would be nice to be a bit more interactive
-                    raise QuarkError("""
+            try:
+                current_origin = self.git('config', '--get', 'remote.origin.url', lco = True).strip().decode('utf-8')
+            except CalledProcessError:
+                current_origin = None
+            if current_origin != self.url.geturl():
+                # For now we just throw a fit; it shouldn't happen often,
+                # and in this case there's no "right" answer - the repo may
+                # have just moved, or we may be dealing with a completely
+                # unrelated repo.
+                # In future, it would be nice to be a bit more interactive
+                raise QuarkError("""
 
 Directory '%s' is a git repository,
 but its remote 'origin' (%r)
 does not match what we expect (%r).
 
 Please either remove the local clone, or fix its remote.""" % (self.directory, current_origin, self.url.geturl()))
-                if self.conf.get("shallow", False):
-                    # Fetch just the commit we need
-                    fork(['git', 'fetch', '--depth', '1', 'origin', self.noremote_ref()])
-                    # Notice that we need FETCH_HEAD, as the shallow clone does not recognize
-                    # origin/HEAD & co.
-                    fork(['git', 'checkout', 'FETCH_HEAD', '--'])
-                else:
-                    fork(['git', 'fetch'])
-                    # If we want to go on a branch, try to find a local branch that tracks it
-                    # and use it (possibly with a fast-forward)
-                    if self.ref_type == 'branch':
-                        # Resolve the remote ref
-                        remote_fullref = self.symbolic_full_name(self.ref)
-                        # Get a sensible local branch name to try
-                        local_ref = remote_fullref.split('/origin/', 1)[1]
-                        # Check if it is actually tracking our target
-                        try:
-                            local_fulltrackref = self.symbolic_full_name(local_ref + "@{u}")
-                        except CalledProcessError:
-                            # It's fine if it fails - we may not have a local-tracking branch,
-                            # so git checkout will do the right thing here
-                            local_fulltrackref = remote_fullref
+            if self.conf.get("shallow", False):
+                # Fetch just the commit we need
+                self.git('fetch', '--depth', '1', 'origin', self.noremote_ref())
+                # Notice that we need FETCH_HEAD, as the shallow clone does not recognize
+                # origin/HEAD & co.
+                self.git('checkout', 'FETCH_HEAD', '--')
+            else:
+                self.git('fetch')
+                # If we want to go on a branch, try to find a local branch that tracks it
+                # and use it (possibly with a fast-forward)
+                if self.ref_type == 'branch':
+                    # Resolve the remote ref
+                    remote_fullref = self.symbolic_full_name(self.ref)
+                    # Get a sensible local branch name to try
+                    local_ref = remote_fullref.split('/origin/', 1)[1]
+                    # Check if it is actually tracking our target
+                    try:
+                        local_fulltrackref = self.symbolic_full_name(local_ref + "@{u}")
+                    except CalledProcessError:
+                        # It's fine if it fails - we may not have a local-tracking branch,
+                        # so git checkout will do the right thing here
+                        local_fulltrackref = remote_fullref
 
-                        if remote_fullref == local_fulltrackref:
-                            try:
-                                # Checkout and fast-forward
-                                fork(['git', 'checkout', local_ref, '--'])
-                                fork(['git', 'merge', '--ff-only', self.ref, '--'])
-                                # Final sanity check
-                                if log_check_output(['git', 'rev-parse', self.ref, '--']) != log_check_output(['git', 'rev-parse', local_ref, '--']):
-                                    logger.warning("Warning: your local branch is ahead of required remote branch!")
-                                return
-                            except CalledProcessError:
-                                logger.warning("Couldn't fast-forward local branch, fallback to detached head mode...")
-                    # General case: plain checkout of the origin ref (going in detached HEAD)
-                    fork(['git', 'checkout', self.ref, '--'])
+                    if remote_fullref == local_fulltrackref:
+                        try:
+                            # Checkout and fast-forward
+                            self.git('checkout', local_ref, '--')
+                            self.git('merge', '--ff-only', self.ref, '--')
+                            # Final sanity check
+                            if self.git('rev-parse', self.ref, '--', lco = True) != self.git('rev-parse', local_ref, '--', lco = True):
+                                logger.warning("Warning: your local branch is ahead of required remote branch!")
+                            return
+                        except CalledProcessError:
+                            logger.warning("Couldn't fast-forward local branch, fallback to detached head mode...")
+                # General case: plain checkout of the origin ref (going in detached HEAD)
+                self.git('checkout', self.ref, '--')
 
         if not exists(self.directory):
             self.checkout()
@@ -399,34 +406,32 @@ Please either remove the local clone, or fix its remote.""" % (self.directory, c
         else:
             actualUpdate()
 
+    def git(self, *args, lco = False):
+        cmd = ('git', '-C', self.directory) + args
+        return log_check_output(cmd) if lco else fork(cmd)
+
     def stash(self):
-        with cd(self.directory):
-            fork(['git', 'stash', '--all'])
+        self.git('stash', '--all')
 
     def pop(self):
-        with cd(self.directory):
-            fork(['git', 'stash', 'pop'])
+        self.git('stash', 'pop')
 
     def clean_all(self):
-        with cd(self.directory):
-            fork(['git', 'clean', '-fd'])
+        self.git('clean', '-fd')
 
     def status(self):
-        fork(['git', "--git-dir=%s/.git" % self.directory, "--work-tree=%s" % self.directory, 'status'])
+        self.git("--git-dir=%s/.git" % self.directory, "--work-tree=%s" % self.directory, 'status')
 
     def has_local_edit(self):
-        with cd(self.directory):
-            return log_check_output(['git', 'status', '--porcelain']) != b""
+        return self.git('status', '--porcelain', lco = True) != b""
 
     def symbolic_full_name(self, ref):
-        with cd(self.directory):
-            return log_check_output(['git', 'rev-parse', '--symbolic-full-name', ref, '--']).split(b'\n')[0].strip().decode('utf-8')
+        return self.git('rev-parse', '--symbolic-full-name', ref, '--', lco = True).split(b'\n')[0].strip().decode('utf-8')
 
     @staticmethod
     def url_from_directory(directory, include_commit = True):
-        with cd(directory):
-            origin = log_check_output(['git', 'remote', 'get-url', 'origin'], universal_newlines=True)[:-1]
-            commit = log_check_output(['git', 'log', '-1', '--format=%H'], universal_newlines=True)[:-1]
+        origin = log_check_output(['git', '-C', directory, 'remote', 'get-url', 'origin'], universal_newlines=True)[:-1]
+        commit = log_check_output(['git', '-C', directory, 'log', '-1', '--format=%H'], universal_newlines=True)[:-1]
         ret = 'git+%s' % (origin,)
         if include_commit:
             ret += '#commit=%s' % (commit,)
@@ -453,9 +458,8 @@ Please either remove the local clone, or fix its remote.""" % (self.directory, c
             mkdir_p(r)
             shutil.copy2(src, dst)
 
-        with cd(source_dir):
-            for t in tracked_files():
-                cp(t, os.path.join(dst_dir, t.decode()))
+        for t in tracked_files():
+            cp(os.path.join(source_dir, t), os.path.join(dst_dir, t.decode()))
 
     def set_local_ignores(self, subprojects_dir, modules):
         BEGIN = "# Following lines automatically generated by quark"
@@ -566,8 +570,11 @@ class SvnSubproject(Subproject):
             return True
         return False
 
+    def svn(self, *args):
+        fork(['svn'] + list(args) + [self.directory])
+
     def checkout(self):
-        fork(['svn', 'checkout', self.url.geturl(), self.directory])
+        self.svn('checkout', self.url.geturl())
 
     def update(self, clean=False):
         if not exists(self.directory):
@@ -575,30 +582,30 @@ class SvnSubproject(Subproject):
         elif not exists(self.directory + "/.svn"):
             not_a_project(self.directory, "Subversion")
         else:
-            with cd(self.directory):
-                if self.has_local_edit():
-                    if clean:
-                        fork(['svn', 'revert', '-R', '.'])
-                        fork(['svn', 'cleanup', '--remove-unversioned', '.'])
-                    else:
-                        logger.warning("Directory '%s' contains local modifications" % self.directory)
-                # svn switch _would be ok_ even just to perform an update, but,
-                # unlike svn up, it touches the timestamp of all the files,
-                # forcing full rebuilds; so, if we are already on the correct
-                # url just use svn up
-
-                # Notice that, unlike other svn commands, -r in svn up works as
-                # a peg revision (the @ syntax), so it takes the URL of the
-                # current working copy and looks it up in the repository _as it
-                # was at the requested revision_ (or HEAD if none is specified)
-                target_base,target_rev = (self.url.geturl().split('@') + [''])[:2]
-                if target_base == self.url_from_checkout(include_commit = False):
-                    fork(['svn', 'up'] + (["-r" + target_rev] if target_rev else []))
+            if self.has_local_edit():
+                if clean:
+                    self.svn('revert', '-R', '.')
+                    self.svn('cleanup', '--remove-unversioned', '.')
                 else:
-                    fork(['svn', 'switch', self.url.geturl()])
+                    logger.warning("Directory '%s' contains local modifications" % self.directory)
+            # svn switch _would be ok_ even just to perform an update, but,
+            # unlike svn up, it touches the timestamp of all the files,
+            # forcing full rebuilds; so, if we are already on the correct
+            # url just use svn up
+
+            # Notice that, unlike other svn commands, -r in svn up works as
+            # a peg revision (the @ syntax), so it takes the URL of the
+            # current working copy and looks it up in the repository _as it
+            # was at the requested revision_ (or HEAD if none is specified)
+            target_base,target_rev = (self.url.geturl().split('@') + [''])[:2]
+            if target_base == self.url_from_checkout(include_commit = False):
+                args = ['up'] + (["-r" + target_rev] if target_rev else [])
+                self.svn(*args)
+            else:
+                self.svn('switch', self.url.geturl(), self.directory)
 
     def status(self):
-        fork(['svn', 'status', self.directory])
+        self.svn('status')
 
     def has_local_edit(self):
         xml = log_check_output(['svn', 'st', '--xml', self.directory], universal_newlines=True)
